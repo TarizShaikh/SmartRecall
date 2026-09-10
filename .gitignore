@@ -1,0 +1,17 @@
+# Local environment and credentials
+.venv/
+.env
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+*.pyc.*
+
+# Personal study data
+data/*.db
+data/*.db-*
+
+# Hosting secrets
+.streamlit/secrets.toml
+.env.*
+!.env.example
