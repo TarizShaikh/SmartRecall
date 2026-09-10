@@ -1,630 +1,242 @@
-import os
-import sqlite3
+"""Owned study records, SQLite storage, and backward-compatible migrations."""
 import hashlib
+import hmac
+import json
+import os
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
-
-# --------------------------------------------------
-# Database Configuration
-# --------------------------------------------------
-
 BASE_DIRECTORY = Path(__file__).resolve().parent.parent
-DATABASE_PATH = Path(os.getenv("SMARTRECALL_DATABASE_PATH", str(BASE_DIRECTORY / "data" / "smartrecall.db")))
+DATABASE_PATH = Path(os.getenv('SMARTRECALL_DATABASE_PATH', str(BASE_DIRECTORY / 'data' / 'smartrecall.db')))
+PASSWORD_ROUNDS = 600_000
 
-
-# --------------------------------------------------
-# Database Connection
-# --------------------------------------------------
 
 def get_connection():
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DATABASE_PATH)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=15)
+    connection.execute('PRAGMA foreign_keys=ON')
+    connection.execute('PRAGMA busy_timeout=15000')
+    return connection
 
 
-# --------------------------------------------------
-# Initialize Database
-# --------------------------------------------------
+def sql(connection, statement, parameters=()):
+    return connection.execute(statement, parameters)
+
+
+@contextmanager
+def transaction(write=False):
+    connection = get_connection()
+    try:
+        if write:
+            connection.execute('BEGIN IMMEDIATE')
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def now():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
 
 def initialize_database():
+    identity = 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    with transaction(write=True) as c:
+        statements = [
+            f'CREATE TABLE IF NOT EXISTS users (id {identity}, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)',
+            f'CREATE TABLE IF NOT EXISTS subjects (id {identity}, user_id INTEGER NOT NULL REFERENCES users(id), name TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)',
+            f'CREATE TABLE IF NOT EXISTS notes (id {identity}, subject_id INTEGER REFERENCES subjects(id), file_name TEXT NOT NULL, extracted_text TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)',
+            f'CREATE TABLE IF NOT EXISTS quiz_attempts (id {identity}, note_id INTEGER REFERENCES notes(id), score REAL NOT NULL, confidence INTEGER, attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)',
+            f"CREATE TABLE IF NOT EXISTS revision_tasks (id {identity}, note_id INTEGER REFERENCES notes(id), retention_score REAL NOT NULL, revision_date TEXT NOT NULL, status TEXT DEFAULT 'Pending')",
+        ]
+        for statement in statements:
+            sql(c, statement)
+        additions = {
+            'notes': {'last_studied_at': 'TEXT'},
+            'quiz_attempts': {'attempt_token': 'TEXT', 'details': 'TEXT'},
+            'revision_tasks': {'completed_at': 'TEXT'},
+        }
+        for table, columns in additions.items():
+            present = {r[1] for r in sql(c, f'PRAGMA table_info({table})').fetchall()}
+            for column, kind in columns.items():
+                if column not in present:
+                    sql(c, f'ALTER TABLE {table} ADD COLUMN {column} {kind}')
+        sql(c, 'CREATE TABLE IF NOT EXISTS learning_material (note_id INTEGER NOT NULL REFERENCES notes(id), kind TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(note_id, kind))')
+        for name, expression in [
+            ('idx_subject_user', 'subjects(user_id)'), ('idx_note_subject', 'notes(subject_id)'),
+            ('idx_quiz_note', 'quiz_attempts(note_id, attempted_at)'), ('idx_revision_note', 'revision_tasks(note_id, status, revision_date)')]:
+            sql(c, f'CREATE INDEX IF NOT EXISTS {name} ON {expression}')
+        sql(c, 'CREATE UNIQUE INDEX IF NOT EXISTS idx_attempt_token ON quiz_attempts(attempt_token)')
 
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS subjects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject_id INTEGER,
-            file_name TEXT NOT NULL,
-            extracted_text TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (subject_id) REFERENCES subjects(id)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS quiz_attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            note_id INTEGER,
-            score REAL NOT NULL,
-            confidence INTEGER,
-            attempted_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (note_id) REFERENCES notes(id)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS revision_tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            note_id INTEGER,
-            retention_score REAL NOT NULL,
-            revision_date TEXT NOT NULL,
-            status TEXT DEFAULT 'Pending',
-            FOREIGN KEY (note_id) REFERENCES notes(id)
-        )
-    """)
-
-    connection.commit()
-    connection.close()
-
-
-# --------------------------------------------------
-# Password Functions
-# --------------------------------------------------
 
 def hash_password(password):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), PASSWORD_ROUNDS).hex()
+    return f'pbkdf2_sha256${PASSWORD_ROUNDS}${salt}${digest}'
 
-    return hashlib.sha256(
-        password.encode()
-    ).hexdigest()
 
+def verify_password(password, stored):
+    if stored.startswith('pbkdf2_sha256$'):
+        try:
+            _, rounds, salt, expected = stored.split('$')
+            rounds = int(rounds)
+            if not 100_000 <= rounds <= 2_000_000:
+                return False
+            actual = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), rounds).hex()
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
+    return hmac.compare_digest(hashlib.sha256(password.encode()).hexdigest(), stored)
 
-# --------------------------------------------------
-# User Registration
-# --------------------------------------------------
 
 def register_user(username, password):
+    username = username.strip()
+    if not 3 <= len(username) <= 60:
+        raise ValueError('Choose a username between 3 and 60 characters.')
+    if not 8 <= len(password) <= 256:
+        raise ValueError('Choose a password between 8 and 256 characters.')
+    password_hash = hash_password(password)
+    with transaction(write=True) as c:
+        result = sql(c, 'INSERT INTO users(username,password_hash) VALUES (?,?) ON CONFLICT(username) DO NOTHING RETURNING id', (username, password_hash)).fetchone()
+        return bool(result)
 
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    try:
-
-        password_hash = hash_password(password)
-
-        cursor.execute(
-            """
-            INSERT INTO users (
-                username,
-                password_hash
-            )
-            VALUES (?, ?)
-            """,
-            (
-                username,
-                password_hash
-            )
-        )
-
-        connection.commit()
-
-        return True
-
-    except sqlite3.IntegrityError:
-
-        return False
-
-    finally:
-
-        connection.close()
-
-
-# --------------------------------------------------
-# User Authentication
-# --------------------------------------------------
 
 def authenticate_user(username, password):
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    password_hash = hash_password(password)
-
-    cursor.execute(
-        """
-        SELECT id, username
-        FROM users
-        WHERE username = ?
-        AND password_hash = ?
-        """,
-        (
-            username,
-            password_hash
-        )
-    )
-
-    user = cursor.fetchone()
-
-    connection.close()
-
-    return user
+    if len(password) > 256:
+        return None
+    with transaction() as c:
+        user = sql(c, 'SELECT id,username,password_hash FROM users WHERE username=?', (username.strip(),)).fetchone()
+    if not user or not verify_password(password, user[2]):
+        return None
+    if not user[2].startswith('pbkdf2_sha256$'):
+        upgraded = hash_password(password)
+        with transaction(write=True) as c:
+            sql(c, 'UPDATE users SET password_hash=? WHERE id=? AND password_hash=?', (upgraded, user[0], user[2]))
+    return user[:2]
 
 
-# --------------------------------------------------
-# Save Notes
-# --------------------------------------------------
-
-def save_note(
-    user_id,
-    subject_name,
-    file_name,
-    extracted_text
-):
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT id
-        FROM subjects
-        WHERE name = ?
-        AND user_id = ?
-        """,
-        (
-            subject_name,
-            user_id
-        )
-    )
-
-    subject = cursor.fetchone()
-
-    if subject:
-
-        subject_id = subject[0]
-
-    else:
-
-        cursor.execute(
-            """
-            INSERT INTO subjects (
-                user_id,
-                name
-            )
-            VALUES (?, ?)
-            """,
-            (
-                user_id,
-                subject_name
-            )
-        )
-
-        subject_id = cursor.lastrowid
-
-    cursor.execute(
-        """
-        INSERT INTO notes (
-            subject_id,
-            file_name,
-            extracted_text
-        )
-        VALUES (?, ?, ?)
-        """,
-        (
-            subject_id,
-            file_name,
-            extracted_text
-        )
-    )
-
-    note_id = cursor.lastrowid
-
-    connection.commit()
-    connection.close()
-
-    return note_id
+def owned_note(c, user_id, note_id, lock=False):
+    statement = 'SELECT n.id FROM notes n JOIN subjects s ON s.id=n.subject_id WHERE n.id=? AND s.user_id=?'
+    if not sql(c, statement, (note_id, user_id)).fetchone():
+        raise ValueError('That study note is not available in your account.')
 
 
-# --------------------------------------------------
-# Get Latest Note
-# --------------------------------------------------
-
-def get_latest_note(user_id):
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            n.id,
-            s.name,
-            n.file_name,
-            n.created_at
-        FROM notes n
-
-        JOIN subjects s
-        ON n.subject_id = s.id
-
-        WHERE s.user_id = ?
-
-        ORDER BY n.id DESC
-
-        LIMIT 1
-        """,
-        (user_id,)
-    )
-
-    note = cursor.fetchone()
-
-    connection.close()
-
-    return note
+def save_note(user_id, subject_name, file_name, extracted_text):
+    if not subject_name.strip() or not extracted_text.strip():
+        raise ValueError('A subject and readable notes are required.')
+    with transaction(write=True) as c:
+        subject = sql(c, 'SELECT id FROM subjects WHERE user_id=? AND name=?', (user_id, subject_name.strip())).fetchone()
+        subject_id = subject[0] if subject else sql(c, 'INSERT INTO subjects(user_id,name) VALUES (?,?) RETURNING id', (user_id, subject_name.strip())).fetchone()[0]
+        existing = sql(c, 'SELECT id FROM notes WHERE subject_id=? AND file_name=? AND extracted_text=? ORDER BY id DESC LIMIT 1', (subject_id, file_name, extracted_text)).fetchone()
+        if existing:
+            return existing[0]
+        return sql(c, 'INSERT INTO notes(subject_id,file_name,extracted_text,last_studied_at) VALUES (?,?,?,?) RETURNING id', (subject_id, file_name, extracted_text, now())).fetchone()[0]
 
 
-# --------------------------------------------------
-# Save Quiz Attempt
-# --------------------------------------------------
-
-def save_quiz_attempt(
-    note_id,
-    score,
-    confidence=None
-):
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO quiz_attempts (
-            note_id,
-            score,
-            confidence
-        )
-        VALUES (?, ?, ?)
-        """,
-        (
-            note_id,
-            score,
-            confidence
-        )
-    )
-
-    connection.commit()
-    connection.close()
+def records(cursor):
+    names = [d[0] for d in cursor.description]
+    return [dict(zip(names, row)) for row in cursor.fetchall()]
 
 
-# --------------------------------------------------
-# Save Revision Task
-# --------------------------------------------------
-
-def save_revision_task(
-    note_id,
-    retention_score,
-    revision_date
-):
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    # A note should have only one active revision schedule at a time.
-    cursor.execute(
-        """
-        SELECT id
-        FROM revision_tasks
-        WHERE note_id = ?
-        AND status = 'Pending'
-        LIMIT 1
-        """,
-        (note_id,)
-    )
-
-    existing_task = cursor.fetchone()
-
-    if existing_task:
-
-        connection.close()
-
-        return False
-
-    cursor.execute(
-        """
-        INSERT INTO revision_tasks (
-            note_id,
-            retention_score,
-            revision_date,
-            status
-        )
-        VALUES (?, ?, ?, 'Pending')
-        """,
-        (
-            note_id,
-            retention_score,
-            revision_date
-        )
-    )
-
-    connection.commit()
-    connection.close()
-
-    return True
+def list_notes(user_id):
+    with transaction() as c:
+        return records(sql(c, 'SELECT n.id,s.name AS subject,n.file_name,n.created_at FROM notes n JOIN subjects s ON s.id=n.subject_id WHERE s.user_id=? ORDER BY n.id DESC', (user_id,)))
 
 
-# --------------------------------------------------
-# Dashboard Statistics
-# --------------------------------------------------
+def get_note(user_id, note_id):
+    with transaction() as c:
+        owned_note(c, user_id, note_id)
+        return records(sql(c, 'SELECT n.*,s.name AS subject FROM notes n JOIN subjects s ON s.id=n.subject_id WHERE n.id=?', (note_id,)))[0]
+
+
+def get_material(user_id, note_id):
+    with transaction() as c:
+        owned_note(c, user_id, note_id)
+        return {kind: json.loads(payload) for kind, payload in sql(c, 'SELECT kind,payload FROM learning_material WHERE note_id=?', (note_id,)).fetchall()}
+
+
+def save_material(user_id, note_id, kind, payload):
+    if kind not in ('summary', 'flashcards', 'quiz', 'keywords'):
+        raise ValueError('Unsupported learning material.')
+    with transaction(write=True) as c:
+        owned_note(c, user_id, note_id)
+        sql(c, 'INSERT INTO learning_material(note_id,kind,payload,updated_at) VALUES (?,?,?,?) ON CONFLICT(note_id,kind) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at', (note_id, kind, json.dumps(payload), now()))
+
+
+def save_quiz_attempt(user_id, note_id, score, attempt_token, details=None):
+    if not 0 <= score <= 100 or not attempt_token:
+        raise ValueError('Invalid quiz result.')
+    with transaction(write=True) as c:
+        owned_note(c, user_id, note_id, lock=True)
+        inserted = sql(c, 'INSERT INTO quiz_attempts(note_id,score,attempt_token,details) VALUES (?,?,?,?) ON CONFLICT(attempt_token) DO NOTHING RETURNING id', (note_id, score, attempt_token, json.dumps(details or []))).fetchone()
+        if inserted:
+            sql(c, 'UPDATE notes SET last_studied_at=? WHERE id=?', (now(), note_id))
+        return bool(inserted)
+
+
+def quiz_history(user_id, note_id):
+    with transaction() as c:
+        owned_note(c, user_id, note_id)
+        return records(sql(c, 'SELECT id,score,attempted_at,details FROM quiz_attempts WHERE note_id=? ORDER BY id DESC', (note_id,)))
+
+
+def save_revision_task(user_id, note_id, retention_score, revision_date):
+    from datetime import date
+    date.fromisoformat(revision_date)
+    with transaction(write=True) as c:
+        owned_note(c, user_id, note_id, lock=True)
+        if sql(c, "SELECT id FROM revision_tasks WHERE note_id=? AND status='Pending'", (note_id,)).fetchone():
+            return False
+        sql(c, 'INSERT INTO revision_tasks(note_id,retention_score,revision_date,status) VALUES (?,?,?,?)', (note_id, retention_score, revision_date, 'Pending'))
+        return True
+
+
+def complete_revision(user_id, task_id, score):
+    from utils.memory_engine import get_revision_date
+    if not 0 <= score <= 100:
+        raise ValueError('Choose a recall score between 0 and 100.')
+    with transaction(write=True) as c:
+        task = sql(c, 'SELECT note_id FROM revision_tasks WHERE id=?', (task_id,)).fetchone()
+        if not task:
+            raise ValueError('Revision not found.')
+        owned_note(c, user_id, task[0], lock=True)
+        updated = sql(c, "UPDATE revision_tasks SET status='Completed',completed_at=? WHERE id=? AND status='Pending'", (now(), task_id)).rowcount
+        if not updated:
+            return False
+        sql(c, 'UPDATE notes SET last_studied_at=? WHERE id=?', (now(), task[0]))
+        # One pending task remains even if legacy data contains duplicate schedules.
+        if not sql(c, "SELECT id FROM revision_tasks WHERE note_id=? AND status='Pending'", (task[0],)).fetchone():
+            sql(c, 'INSERT INTO revision_tasks(note_id,retention_score,revision_date,status) VALUES (?,?,?,?)', (task[0], 100, get_revision_date(score).isoformat(), 'Pending'))
+        return True
+
+
+def list_revisions(user_id):
+    with transaction() as c:
+        return records(sql(c, 'SELECT rt.*,s.name AS subject,n.file_name FROM revision_tasks rt JOIN notes n ON n.id=rt.note_id JOIN subjects s ON s.id=n.subject_id WHERE s.user_id=? ORDER BY rt.revision_date,rt.id', (user_id,)))
+
 
 def get_dashboard_statistics(user_id):
+    with transaction() as c:
+        notes = sql(c, 'SELECT COUNT(*) FROM notes n JOIN subjects s ON s.id=n.subject_id WHERE s.user_id=?', (user_id,)).fetchone()[0]
+        quizzes, average = sql(c, 'SELECT COUNT(*),AVG(q.score) FROM quiz_attempts q JOIN notes n ON n.id=q.note_id JOIN subjects s ON s.id=n.subject_id WHERE s.user_id=?', (user_id,)).fetchone()
+        pending, upcoming = sql(c, "SELECT COUNT(*),MIN(r.revision_date) FROM revision_tasks r JOIN notes n ON n.id=r.note_id JOIN subjects s ON s.id=n.subject_id WHERE s.user_id=? AND r.status='Pending'", (user_id,)).fetchone()
+    return dict(notes=notes, quizzes=quizzes, average_score=round(average or 0, 1), pending_revisions=pending, next_revision=upcoming)
 
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    # Total notes
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM notes n
-
-        JOIN subjects s
-        ON n.subject_id = s.id
-
-        WHERE s.user_id = ?
-        """,
-        (user_id,)
-    )
-
-    total_notes = cursor.fetchone()[0]
-
-
-    # Total quizzes
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM quiz_attempts qa
-
-        JOIN notes n
-        ON qa.note_id = n.id
-
-        JOIN subjects s
-        ON n.subject_id = s.id
-
-        WHERE s.user_id = ?
-        """,
-        (user_id,)
-    )
-
-    total_quizzes = cursor.fetchone()[0]
-
-
-    # Average quiz score
-    cursor.execute(
-        """
-        SELECT AVG(qa.score)
-        FROM quiz_attempts qa
-
-        JOIN notes n
-        ON qa.note_id = n.id
-
-        JOIN subjects s
-        ON n.subject_id = s.id
-
-        WHERE s.user_id = ?
-        """,
-        (user_id,)
-    )
-
-    average_score = cursor.fetchone()[0]
-
-    if average_score is None:
-
-        average_score = 0
-
-    else:
-
-        average_score = round(
-            average_score,
-            1
-        )
-
-
-    # Pending revisions
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM revision_tasks rt
-
-        JOIN notes n
-        ON rt.note_id = n.id
-
-        JOIN subjects s
-        ON n.subject_id = s.id
-
-        WHERE s.user_id = ?
-        AND rt.status = 'Pending'
-        """,
-        (user_id,)
-    )
-
-    pending_revisions = cursor.fetchone()[0]
-
-
-    # Next revision
-    cursor.execute(
-        """
-        SELECT MIN(rt.revision_date)
-        FROM revision_tasks rt
-
-        JOIN notes n
-        ON rt.note_id = n.id
-
-        JOIN subjects s
-        ON n.subject_id = s.id
-
-        WHERE s.user_id = ?
-        AND rt.status = 'Pending'
-        """,
-        (user_id,)
-    )
-
-    next_revision = cursor.fetchone()[0]
-
-    connection.close()
-
-    return {
-        "notes": total_notes,
-        "quizzes": total_quizzes,
-        "average_score": average_score,
-        "pending_revisions": pending_revisions,
-        "next_revision": next_revision
-    }
-
-
-# --------------------------------------------------
-# Recent Notes
-# --------------------------------------------------
 
 def get_recent_notes(user_id, limit=5):
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            s.name,
-            n.file_name,
-            n.created_at
-        FROM notes n
-
-        JOIN subjects s
-        ON n.subject_id = s.id
-
-        WHERE s.user_id = ?
-
-        ORDER BY n.created_at DESC
-
-        LIMIT ?
-        """,
-        (
-            user_id,
-            limit
-        )
-    )
-
-    notes = cursor.fetchall()
-
-    connection.close()
-
-    return notes
+    return [(n['subject'], n['file_name'], n['created_at']) for n in list_notes(user_id)[:limit]]
 
 
-# --------------------------------------------------
-# Recent Quiz Attempts
-# --------------------------------------------------
-
-def get_recent_quiz_attempts(
-    user_id,
-    limit=5
-):
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            s.name,
-            qa.score,
-            qa.attempted_at
-        FROM quiz_attempts qa
-
-        JOIN notes n
-        ON qa.note_id = n.id
-
-        JOIN subjects s
-        ON n.subject_id = s.id
-
-        WHERE s.user_id = ?
-
-        ORDER BY qa.attempted_at DESC
-
-        LIMIT ?
-        """,
-        (
-            user_id,
-            limit
-        )
-    )
-
-    attempts = cursor.fetchall()
-
-    connection.close()
-
-    return attempts
+def get_recent_quiz_attempts(user_id, limit=5):
+    with transaction() as c:
+        return sql(c, 'SELECT s.name,q.score,q.attempted_at FROM quiz_attempts q JOIN notes n ON n.id=q.note_id JOIN subjects s ON s.id=n.subject_id WHERE s.user_id=? ORDER BY q.id DESC LIMIT ?', (user_id, limit)).fetchall()
 
 
-# --------------------------------------------------
-# Upcoming Revision Tasks
-# --------------------------------------------------
-
-def get_upcoming_revisions(
-    user_id,
-    limit=5
-):
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            s.name,
-            rt.retention_score,
-            rt.revision_date,
-            rt.status
-        FROM revision_tasks rt
-
-        JOIN notes n
-        ON rt.note_id = n.id
-
-        JOIN subjects s
-        ON n.subject_id = s.id
-
-        WHERE s.user_id = ?
-        AND rt.status = 'Pending'
-
-        ORDER BY rt.revision_date ASC
-
-        LIMIT ?
-        """,
-        (
-            user_id,
-            limit
-        )
-    )
-
-    revisions = cursor.fetchall()
-
-    connection.close()
-
-    return revisions
-
+def get_upcoming_revisions(user_id, limit=5):
+    return [(r['subject'],r['retention_score'],r['revision_date'],r['status']) for r in list_revisions(user_id) if r['status']=='Pending'][:limit]

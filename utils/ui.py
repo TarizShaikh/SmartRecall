@@ -1,7 +1,7 @@
 from html import escape
 import streamlit as st
 
-PAGES = [('app.py', 'Overview', '◈'), ('pages/1_Study_Notes.py', 'Study notes', '📚'), ('pages/2_Flashcards.py', 'Flashcards', '🗂️'), ('pages/3_Quiz.py', 'Practice quiz', '✏️'), ('pages/4_Memory_Revision.py', 'Memory & revision', '📈'), ('pages/5_Profile.py', 'Your profile', '👤')]
+PAGES = [('app.py', 'Overview', '◈'), ('pages/1_Study_Notes.py', 'Study library', '📚'), ('pages/2_Flashcards.py', 'Flashcards', '🗂️'), ('pages/3_Quiz.py', 'Practice quiz', '✏️'), ('pages/4_Memory_Revision.py', 'Memory & revision', '📈'), ('pages/5_Profile.py', 'Your profile', '👤')]
 
 def setup_ui():
     st.markdown('''<style>
@@ -62,5 +62,6 @@ def empty_state(title, description):
 
 def activity_row(title, detail):
     st.markdown(f'<div class="sr-row"><strong>{escape(str(title))}</strong><small>{escape(str(detail))}</small></div>', unsafe_allow_html=True)
+
 
 
