@@ -12,9 +12,9 @@ for key, value in {'logged_in': False, 'username': '', 'user_id': None, 'extract
     if key not in st.session_state:
         st.session_state[key] = value
 setup_ui()
-if not st.session_state.get('_database_initialized'):
+if not st.session_state.get('_database_v2_initialized'):
     initialize_database()
-    st.session_state['_database_initialized'] = True
+    st.session_state['_database_v2_initialized'] = True
 
 if not st.session_state.logged_in:
     intro, account = st.columns([1.2, 1], gap="large")
@@ -51,8 +51,10 @@ if not st.session_state.logged_in:
                 if create:
                     if not new_username.strip():
                         st.warning('Please enter a username.')
-                    elif not new_password:
-                        st.warning('Please enter a password.')
+                    elif not 3 <= len(new_username.strip()) <= 60:
+                        st.warning('Choose a username between 3 and 60 characters.')
+                    elif not 8 <= len(new_password) <= 256:
+                        st.warning('Choose a password between 8 and 256 characters.')
                     elif new_password != confirm_password:
                         st.warning('Passwords do not match.')
                     elif register_user(new_username.strip(), new_password):

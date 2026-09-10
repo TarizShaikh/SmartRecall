@@ -15,3 +15,7 @@ data/*.db-*
 .streamlit/secrets.toml
 .env.*
 !.env.example
+
+# Development intermediates
+tmp/
+
