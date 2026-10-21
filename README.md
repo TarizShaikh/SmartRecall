@@ -1,7 +1,8 @@
 # SmartRecall
 
 A Streamlit study assistant with saved notes, AI summaries and key concepts, interactive flashcards, validated quizzes, and a rule-based revision calendar.
-Live Link :- https://smartrecall-tariz.streamlit.app 
+
+**Live Link** :- https://smartrecall-tariz.streamlit.app 
 
 ## Run locally
 
